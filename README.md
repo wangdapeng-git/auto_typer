@@ -12,7 +12,7 @@ pip3 install customtkinter==5.2.2 -i https://pypi.tuna.tsinghua.edu.cn/simple/
 pip3 install pyinstaller==6.9.0 -i https://pypi.tuna.tsinghua.edu.cn/simple/  
 pip3 install reedsolo==1.7.0 -i https://pypi.tuna.tsinghua.edu.cn/simple/  
 
-打包命令：pyinstaller --onefile --windowed data_utility/tools/dp_autotype_gui.py 
+打包命令：pyinstaller --onefile --windowed dp_autotype_gui.py 
 
 注意：
 - 需要在windows环境下运行该文件，才能生成exe文件
