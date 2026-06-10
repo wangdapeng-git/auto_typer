@@ -57,11 +57,12 @@ class AutoTyperApp(ctk.CTk):
         self.help_tips = []
 
         self.is_paused = False
-        self.stop_typing = False
         self.typing_active = False
         self.current_encoded_str = ""
         self.total_chunks = 0
         self.completed_chunks = 0
+        self.typing_thread = None
+        self.stop_event = threading.Event()
         self.kb_controller = Controller()
 
         self.build_ui()
@@ -159,7 +160,7 @@ class AutoTyperApp(ctk.CTk):
             "最大纠错字符（整数）",
             "纠错字符",
             "10",
-            "仅 base64 + 增强模式生效。值越大，纠错能力越强，但输出长度也会增加。",
+            "增强模式生效。值越大，纠错能力越强，但输出长度也会增加。",
             "通常保持默认值 10 即可；远程输入越不稳定，越适合适度调大。",
         )
         self.fix_sym_group.pack(side="left", padx=8, pady=8, fill="x", expand=True)
@@ -178,9 +179,32 @@ class AutoTyperApp(ctk.CTk):
         self.setting_frame2 = ctk.CTkFrame(self)
         self.setting_frame2.pack(pady=(0, 6), fill="x", padx=20)
 
+        self.mode_group = ctk.CTkFrame(self.setting_frame2, fg_color="transparent")
+        self.mode_group.pack(side="left", padx=(12, 24), pady=8, fill="x")
+
+        mode_label_row = ctk.CTkFrame(self.mode_group, fg_color="transparent")
+        mode_label_row.pack(anchor="w")
+        mode_label = ctk.CTkLabel(mode_label_row, text="编码模式")
+        mode_label.pack(side="left")
+        self.add_help_badge(
+            mode_label_row,
+            "默认模式输出标准编码；小写模式仅使用 0-9 和 a-z，更适合对字符集有限制的输入场景。",
+            padx=(2, 0),
+            pady=(0, 8),
+        )
+
+        self.mode_segmented = ctk.CTkSegmentedButton(
+            self.mode_group,
+            values=["默认模式", "小写模式"],
+            command=lambda _value: self.refresh_estimate(),
+        )
+        self.mode_segmented.pack(anchor="w", pady=(4, 0), fill="x")
+        self.mode_segmented.set("默认模式")
+        self.bind_help_tip(self.mode_segmented, "二选一：默认模式输出标准编码；小写模式输出仅含 0-9 和 a-z 的小写编码。")
+
         self.enhanced_mode_var = ctk.BooleanVar(value=False)
         self.enhanced_mode_group = ctk.CTkFrame(self.setting_frame2, fg_color="transparent")
-        self.enhanced_mode_group.pack(side="left", padx=(12, 18), pady=8)
+        self.enhanced_mode_group.pack(side="left", padx=(0, 18), pady=8)
         self.enhanced_mode_checkbox = ctk.CTkCheckBox(
             self.enhanced_mode_group,
             text="增强模式",
@@ -190,23 +214,8 @@ class AutoTyperApp(ctk.CTk):
             command=self.refresh_estimate,
         )
         self.enhanced_mode_checkbox.pack(side="left")
-        self.bind_help_tip(self.enhanced_mode_checkbox, "仅 base64 模式生效：先压缩，再加入纠错信息。")
+        self.bind_help_tip(self.enhanced_mode_checkbox, "对当前编码模式加入纠错信息。小写模式下会把纠错参数写入编码负载。")
         self.add_help_badge(self.enhanced_mode_group, "增强模式会增加容错率，但输出也会更长。", padx=(2, 0), pady=(0, 8))
-
-        self.lowercase_mode_var = ctk.BooleanVar(value=False)
-        self.lowercase_mode_group = ctk.CTkFrame(self.setting_frame2, fg_color="transparent")
-        self.lowercase_mode_group.pack(side="left", padx=(0, 12), pady=8)
-        self.lowercase_mode_checkbox = ctk.CTkCheckBox(
-            self.lowercase_mode_group,
-            text="小写模式",
-            variable=self.lowercase_mode_var,
-            onvalue=True,
-            offvalue=False,
-            command=self.refresh_estimate,
-        )
-        self.lowercase_mode_checkbox.pack(side="left")
-        self.bind_help_tip(self.lowercase_mode_checkbox, "使用仅含 0-9 和 a-z 的压缩 base36 编码，通常比 hex 更短。")
-        self.add_help_badge(self.lowercase_mode_group, "小写模式下会自动启用压缩型 base36，以减少打字量。", padx=(2, 0), pady=(0, 8))
 
         estimate_frame = ctk.CTkFrame(self)
         estimate_frame.pack(pady=(0, 6), fill="x", padx=20)
@@ -262,7 +271,17 @@ class AutoTyperApp(ctk.CTk):
         self.fix_sym_max_entry.bind("<KeyRelease>", lambda _event: self.refresh_estimate(), add="+")
 
     def bind_help_tip(self, widget, text):
-        self.help_tips.append(HoverTip(widget, text))
+        if widget is None or not text:
+            return
+
+        try:
+            self.help_tips.append(HoverTip(widget, text))
+            return
+        except (AttributeError, NotImplementedError, tk.TclError):
+            pass
+
+        for child in widget.winfo_children():
+            self.bind_help_tip(child, text)
 
     def add_help_badge(self, parent, text, side="left", padx=(2, 0), pady=(0, 8)):
         help_badge = ctk.CTkLabel(
@@ -320,6 +339,9 @@ class AutoTyperApp(ctk.CTk):
         except ValueError:
             return 0.1
 
+    def is_lowercase_mode(self):
+        return self.mode_segmented.get() == "小写模式"
+
     def get_input_bytes(self):
         file_path = self.file_path_entry.get().strip()
         input_text = self.text_input.get("1.0", "end-1c")
@@ -334,8 +356,8 @@ class AutoTyperApp(ctk.CTk):
     def build_encoded_content(self, content):
         return encode_payload(
             content,
-            lowercase_mode=bool(self.lowercase_mode_var.get()),
-            enhanced_mode=bool(self.enhanced_mode_var.get()) and not bool(self.lowercase_mode_var.get()),
+            lowercase_mode=self.is_lowercase_mode(),
+            enhanced_mode=bool(self.enhanced_mode_var.get()),
             n_sym=self.get_fix_sym_count(),
         )
 
@@ -349,8 +371,8 @@ class AutoTyperApp(ctk.CTk):
         step_len = self.get_one_step_len()
         chunks = math.ceil(len(encoded) / step_len) if encoded else 0
         total_seconds = self.get_wait_time() + (chunks * self.get_step_interval())
-        mode_name = "base36" if bool(self.lowercase_mode_var.get()) else "base64"
-        if bool(self.enhanced_mode_var.get()) and not bool(self.lowercase_mode_var.get()):
+        mode_name = "小写模式" if self.is_lowercase_mode() else "默认模式"
+        if bool(self.enhanced_mode_var.get()):
             mode_name += "+增强"
 
         self.current_encoded_str = encoded
@@ -390,6 +412,10 @@ class AutoTyperApp(ctk.CTk):
 
     def start_typing(self):
         self.append_log("Info: start_typing")
+        if self.typing_active:
+            self.append_log("Error: 当前已有进行中的打字任务。")
+            return
+
         try:
             one_step_len = int(self.one_step_len_entry.get())
         except ValueError:
@@ -411,7 +437,7 @@ class AutoTyperApp(ctk.CTk):
         self.total_chunks = math.ceil(len(self.current_encoded_str) / max(1, one_step_len)) if self.current_encoded_str else 0
         self.reset_progress()
         self.typing_active = True
-        self.stop_typing = False
+        self.stop_event.clear()
         self.is_paused = False
         self.typing_thread = threading.Thread(
             target=self.type_content,
@@ -426,44 +452,85 @@ class AutoTyperApp(ctk.CTk):
             self.append_log(f"打字 {'暂停' if self.is_paused else '恢复'}.")
 
     def stop_typing_by_button(self):
-        self.stop_typing = True
+        self.is_paused = False
+        self.stop_event.set()
         self.append_log("终止打字任务")
 
     def split_chunks(self, text, chunk_size):
         for index in range(0, len(text), chunk_size):
             yield text[index:index + chunk_size]
 
+    def wait_with_stop(self, seconds, slice_seconds=0.05):
+        end_time = time.monotonic() + max(0.0, seconds)
+        while not self.stop_event.is_set():
+            remaining = end_time - time.monotonic()
+            if remaining <= 0:
+                return True
+            time.sleep(min(slice_seconds, remaining))
+        return False
+
+    def type_chunk(self, chunk):
+        for char in chunk:
+            if self.stop_event.is_set():
+                return False
+            self.kb_controller.type(char)
+        return True
+
     def type_content(self, encoded_str, one_step_len, step_interval):
         wait_time_len = self.get_wait_time()
-        for countdown in range(wait_time_len):
-            if self.stop_typing:
-                break
-            left_seconds = wait_time_len - countdown
-            self.append_log(f"即将开始打字，请将光标移到需要打字的窗口。倒计时: {left_seconds}")
-            time.sleep(1)
+        was_stopped = False
+        pause_logged = False
 
-        chunks = list(self.split_chunks(encoded_str, max(1, one_step_len)))
-        total = len(chunks)
-        for chunk in chunks:
-            if self.stop_typing:
-                break
-            while self.is_paused and not self.stop_typing:
-                self.append_log("打字任务暂停中，等待恢复")
-                time.sleep(0.5)
+        try:
+            for countdown in range(wait_time_len):
+                if self.stop_event.is_set():
+                    was_stopped = True
+                    break
+                left_seconds = wait_time_len - countdown
+                self.append_log(f"即将开始打字，请将光标移到需要打字的窗口。倒计时: {left_seconds}")
+                if not self.wait_with_stop(1):
+                    was_stopped = True
+                    break
 
-            if self.stop_typing:
-                break
+            chunks = list(self.split_chunks(encoded_str, max(1, one_step_len)))
+            total = len(chunks)
+            for chunk in chunks:
+                if self.stop_event.is_set():
+                    was_stopped = True
+                    break
 
-            self.append_log(f"打字中: {chunk[:10]}")
-            self.kb_controller.type(chunk)
-            self.completed_chunks += 1
-            self.after(0, self.update_progress, self.completed_chunks, total)
-            threading.Event().wait(step_interval)
+                while self.is_paused and not self.stop_event.is_set():
+                    if not pause_logged:
+                        self.append_log("打字任务暂停中，等待恢复")
+                        pause_logged = True
+                    if not self.wait_with_stop(0.1):
+                        was_stopped = True
+                        break
 
-        self.typing_active = False
-        if not self.stop_typing:
+                if self.stop_event.is_set():
+                    was_stopped = True
+                    break
+
+                pause_logged = False
+                self.append_log(f"打字中: {chunk[:10]}")
+                if not self.type_chunk(chunk):
+                    was_stopped = True
+                    break
+
+                self.completed_chunks += 1
+                self.after(0, self.update_progress, self.completed_chunks, total)
+                if not self.wait_with_stop(step_interval):
+                    was_stopped = True
+                    break
+        finally:
+            self.typing_active = False
+            self.is_paused = False
+            self.stop_event.clear()
+
+        if was_stopped:
+            self.append_log("打字任务已停止。")
+        else:
             self.append_log("打字完成。")
-        self.stop_typing = False
 
 
 if __name__ == "__main__":
